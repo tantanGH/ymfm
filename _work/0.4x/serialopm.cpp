@@ -28,7 +28,6 @@
 // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-#include <iostream>
 #include <stdio.h>
 #include <string.h>
 #include <fcntl.h>
@@ -41,17 +40,18 @@
 #include "../src/ymfm.h"
 #include "../src/ymfm_opm.h"
 
-#define VERSION "0.5.0 (2023/05/14)"
+#define VERSION "0.4.0 (2023/05/13)"
 
-using namespace std;
-using namespace ymfm;
+#define OPM_SAMPLE_RATE     (62500)
+#define OUT_SAMPLE_RATE     (44100)
+#define OUT_PCM_BUFFER_SIZE (OUT_SAMPLE_RATE * 4 * 180)
 
-static bool g_abort_program = false;
+volatile bool abort_program = false;
 
-void sigint_handler(int signal) {
+void signal_handler(int signal) {
   if (signal == SIGINT) {
-    g_abort_program = true;
-    std::cout << "CTRL+C is pressed." << std::endl;
+    printf("CTRL+C is pressed.\n");
+    abort_program = true;
   }
 }
 
@@ -59,15 +59,12 @@ int32_t open_serial_port(const char* device_name) {
 
   int32_t rc = -1;
 
-  int32_t port = open(device_name, O_RDWR);
-  if (port <= 0) {
-    std::cout << "Error: serial port open error." << std::endl;
-    goto exit;
-  }
+  int32_t serial_port = open(device_name, O_RDWR);
+  if (serial_port <= 0) goto exit;
 
   struct termios tty;
-  if (tcgetattr(port, &tty) != 0) {
-    std::cout << "Error: " << errno << " from tcgetattr: " << strerror(errno) << std::endl;
+  if (tcgetattr(serial_port, &tty) != 0) {
+    printf("Error %i from tcgetattr: %s\n", errno, strerror(errno));
     goto exit;
   }
 
@@ -79,116 +76,59 @@ int32_t open_serial_port(const char* device_name) {
   cfsetispeed(&tty, B38400);
   cfsetospeed(&tty, B38400);
 
-  if (tcsetattr(port, TCSANOW, &tty) != 0) {
-    std::cout << "Error: " << errno << " from tcsetattr: " << strerror(errno) << std::endl;
+  if (tcsetattr(serial_port, TCSANOW, &tty) != 0) {
+    printf("Error %i from tcsetattr: %s\n", errno, strerror(errno));
     goto exit;
   }
 
-  rc = port;
+  rc = serial_port;
 
 exit:
   return rc;
 }
 
-class SerialOPM {
-
-  public:
-    static const uint32_t OPM_SAMPLE_RATE = 62500;
-    static const uint32_t OUT_SAMPLE_RATE = 44100;
-    static const uint32_t OUT_PCM_BUFFER_SIZE = 44100 * 4 * 1;
-
-  public:
-    SerialOPM(uint32_t clock);
-    ~SerialOPM();
-    void reset();
-    void generate();
-    void write(uint8_t opm_reg, uint8_t opm_data);
-    bool is_opm_register(uint8_t reg);
-    bool is_busy();
-
-  private:
-    uint32_t clock;
-    uint32_t downsample_counter;
-    ymfm::ymfm_interface* ymfm_inf;
-    ymfm::ym2151* opm_chip;
-
-  public:
-    uint32_t generated_counter;
-    std::vector<uint8_t> out_pcm_data;
-
-};
-
-SerialOPM::SerialOPM(uint32_t clock) {
-
-  this->clock = clock;
-
-  this->ymfm_inf = new ymfm::ymfm_interface();
-  this->opm_chip = new ymfm::ym2151(*(this->ymfm_inf));
-  this->opm_chip->reset();
-
-  this->reset();
-}
-
-SerialOPM::~SerialOPM() {
-  delete this->opm_chip;
-  delete this->ymfm_inf;
-}
-
-void SerialOPM::reset() {
-  this->generated_counter = 0;
-  this->downsample_counter = 0;
-}
-
-bool SerialOPM::is_opm_register(uint8_t reg) {
+bool is_opm_register(uint8_t reg) {
   return (reg == 0x01 || reg == 0x08 || reg == 0x0f || reg == 0x10 || reg == 0x11 ||
           reg == 0x12 || reg == 0x14 || reg == 0x18 || reg == 0x19 || reg == 0x1b ||
           (reg >= 0x20 && reg <= 0xff)) ? true : false;
 }
 
-void SerialOPM::generate() {
+void opm_generate(ymfm::ym2151& opm_chip, std::vector<uint8_t>& out_pcm_data, uint32_t& downsample_counter) {
 
   ymfm::ym2151::output_data opm_pcm_data;
-  this->opm_chip->generate(&opm_pcm_data);
+  opm_chip.generate(&opm_pcm_data);
 
-  this->downsample_counter += SerialOPM::OUT_SAMPLE_RATE;
-  if (this->downsample_counter >= SerialOPM::OPM_SAMPLE_RATE) {
+  downsample_counter += OUT_SAMPLE_RATE;
+  if (downsample_counter >= OPM_SAMPLE_RATE) {
     int16_t data_l = opm_pcm_data.data [ 0 ];   // output is 14bit PCM
     int16_t data_r = opm_pcm_data.data [ 1 ];
-    this->out_pcm_data.push_back((((uint16_t)data_l) >> 8) & 0xff);
-    this->out_pcm_data.push_back(((uint16_t)data_l) & 0xff);
-    this->out_pcm_data.push_back((((uint16_t)data_r) >> 8) & 0xff);
-    this->out_pcm_data.push_back(((uint16_t)data_r) & 0xff);
-    this->downsample_counter -= SerialOPM::OPM_SAMPLE_RATE;
+    out_pcm_data.push_back((((uint16_t)data_l) >> 8) & 0xff);
+    out_pcm_data.push_back(((uint16_t)data_l) & 0xff);
+    out_pcm_data.push_back((((uint16_t)data_r) >> 8) & 0xff);
+    out_pcm_data.push_back(((uint16_t)data_r) & 0xff);
+    downsample_counter -= OPM_SAMPLE_RATE;
   }
-
-  this->generated_counter++;
 }
 
-bool SerialOPM::is_busy() {
-  return (this->opm_chip->read_status() & 0x80) ? true: false;
-}
-
-void SerialOPM::write(uint8_t opm_reg, uint8_t opm_data) {
-
-  while (this->is_busy()) {
-    this->generate();
+uint32_t opm_write(ymfm::ym2151& opm_chip, std::vector<uint8_t>& out_pcm_data, uint32_t& downsample_counter, uint8_t opm_reg, uint8_t opm_data) {
+  uint32_t opm_generated = 0;
+  while (opm_chip.read_status() & 0x80) {
+    opm_generate(opm_chip, out_pcm_data, downsample_counter);
+    opm_generated++;
   }
-  this->opm_chip->write_address(opm_reg);
-  while (this->is_busy()) {
-    this->generate();
+  opm_chip.write_address(opm_reg);
+  while (opm_chip.read_status() & 0x80) {
+    opm_generate(opm_chip, out_pcm_data, downsample_counter);
+    opm_generated++;
   }
-  this->opm_chip->write_data(opm_data);
-  this->generate();
+  opm_chip.write_data(opm_data);
+  return opm_generated;
 }
 
 int32_t main(int argc, char* argv[]) {
 
-  // program exit code
   int32_t rc = -1;
 
-
-  // work variables
-  int32_t serial_port;
   static uint8_t read_buf [ 1024 ];
   memset(&read_buf, '\0', sizeof(read_buf));
 
@@ -201,38 +141,48 @@ int32_t main(int argc, char* argv[]) {
   struct timeval start_time = { 0 };
   struct timeval current_time = { 0 };
 
+  std::vector<uint8_t> out_pcm_data;
+  uint32_t downsample_counter = 0;
+  uint32_t out_pcm_index = 0;
+
   FILE* fp_out = NULL;
 
-
   // credit
-  std::cout << "Serial OPM emulator - serialopm version " << VERSION << " tantan" << std::endl;
-  std::cout << "--" << std::endl;
-  std::cout << "ymfm Copyright (c) 2021, Aaron Giles" << std::endl;
-  std::cout << "All rights reserved." << std::endl;
-  std::cout << "--" << std::endl;
+  printf("Serial OPM emulator - serialopm version " VERSION " tantan\n");
+  printf("--\n");
+  printf("ymfm Copyright (c) 2021, Aaron Giles\n");
+  printf("All rights reserved.\n");
+  printf("--\n");
 
 
-  // serial OPM engine
-  SerialOPM opm = SerialOPM(4000000);
-  std::cout << "Completed YM2151 engine initialization." << std::endl;
+  // ym2151 engine
+  ymfm::ymfm_interface ymfm_inf = ymfm::ymfm_interface();
+  ymfm::ym2151 opm_chip = ymfm::ym2151(ymfm_inf);
+  opm_chip.reset();
+
+  uint32_t opm_clock = 4000000;                                   // X68000 is using 4MHz, not 3.58MHz
+  uint32_t opm_sample_rate = opm_chip.sample_rate(opm_clock);     // 4000000/2/32 = 62500Hz
+  uint32_t opm_step = 1000000 / opm_sample_rate;                  // 1000000/62500 = 16us
+  uint32_t opm_generated = 0;
+ 
+  uint32_t out_sample_rate = 44100;
+
+  printf("Completed YM2151 engine initialization.\n");
 
 
   // UART receiver
-  serial_port = open_serial_port("/dev/tty.usbserial-A10ORWNF");
-  if (serial_port <= 0) {
-    goto exit;
-  }
-  std::cout << "Completed serial port initialization." << std::endl;
+//  int32_t serial_port = open_serial_port("/dev/serial0");
+  int32_t serial_port = open_serial_port("/dev/tty.usbserial-A10ORWNF");
+  if (serial_port <= 0) goto exit;
+  printf("Completed serial port initialization.\n");
 
 
-  // sigint signal handler
-  g_abort_program = false;
-  signal(SIGINT, sigint_handler);
-
+  // signal handler
+  signal(SIGINT, signal_handler);
 
   // stream header detection
   read_len = 0;
-  while (!g_abort_program) {
+  while (!abort_program) {
 
     int32_t len = read(serial_port, read_buf + read_len, 10 - read_len);
     if (len < 0) {
@@ -250,16 +200,16 @@ int32_t main(int argc, char* argv[]) {
             read_buf[0], read_buf[1], read_buf[2], read_buf[3], read_buf[4], 
             read_buf[5], read_buf[6], read_buf[7], read_buf[8], read_buf[9]);
 
-    if (opm.is_opm_register(read_buf[0]) &&
-        opm.is_opm_register(read_buf[2]) &&
-        opm.is_opm_register(read_buf[4]) &&
-        opm.is_opm_register(read_buf[6]) &&
-        opm.is_opm_register(read_buf[8])) {
-      opm.write(read_buf[0], read_buf[1]);
-      opm.write(read_buf[2], read_buf[3]);
-      opm.write(read_buf[4], read_buf[5]);
-      opm.write(read_buf[6], read_buf[7]);
-      opm.write(read_buf[8], read_buf[9]);
+    if (is_opm_register(read_buf[0]) &&
+        is_opm_register(read_buf[2]) &&
+        is_opm_register(read_buf[4]) &&
+        is_opm_register(read_buf[6]) &&
+        is_opm_register(read_buf[8])) {
+      opm_write(opm_chip, out_pcm_data, downsample_counter, read_buf[0], read_buf[1]);
+      opm_write(opm_chip, out_pcm_data, downsample_counter, read_buf[2], read_buf[3]);
+      opm_write(opm_chip, out_pcm_data, downsample_counter, read_buf[4], read_buf[5]);
+      opm_write(opm_chip, out_pcm_data, downsample_counter, read_buf[6], read_buf[7]);
+      opm_write(opm_chip, out_pcm_data, downsample_counter, read_buf[8], read_buf[9]);
       break;
     } else {
       memmove(read_buf, read_buf + 1, 9);
@@ -269,14 +219,14 @@ int32_t main(int argc, char* argv[]) {
   }
 
   // output file prep
-  if (!g_abort_program) {
+  if (!abort_program) {
     fp_out = fopen("output.s44", "wb");
   }
 
   gettimeofday(&start_time, NULL);
 
   // main loop
-  while (!g_abort_program) {
+  while (!abort_program) {
 
     int32_t len = read(serial_port, read_buf, sizeof(read_buf));
     if (len < 0) {
@@ -291,13 +241,13 @@ int32_t main(int argc, char* argv[]) {
         if (i + 1 < len) {
           opm_data = read_buf[ i + 1 ];
           i++;
-          opm.write(opm_reg, opm_data);
+          opm_generated += opm_write(opm_chip, out_pcm_data, downsample_counter, opm_reg, opm_data);
           opm_reg = 0;
           opm_data = 0;
         }
       } else {
         opm_data = read_buf[ i ];
-        opm.write(opm_reg, opm_data);
+        opm_generated += opm_write(opm_chip, out_pcm_data, downsample_counter, opm_reg, opm_data);
         opm_reg = 0;
         opm_data = 0;
       }
@@ -305,13 +255,14 @@ int32_t main(int argc, char* argv[]) {
 
     gettimeofday(&current_time, NULL);
     uint32_t elapsed_usec = (current_time.tv_sec - start_time.tv_sec) * 1000000 + (current_time.tv_usec - start_time.tv_usec);
-    uint32_t total_ticks = elapsed_usec * SerialOPM::OPM_SAMPLE_RATE / 1000000;
-    while (opm.generated_counter < total_ticks) {
-      opm.generate();
+    uint32_t total_ticks = elapsed_usec / opm_step;
+    while (opm_generated < total_ticks) {
+      opm_generate(opm_chip, out_pcm_data, downsample_counter);
+      opm_generated++;
     }
-    if (opm.out_pcm_data.size() >= SerialOPM::OUT_PCM_BUFFER_SIZE) {
-      fwrite(opm.out_pcm_data.data(), 1, opm.out_pcm_data.size(), fp_out);
-      opm.out_pcm_data.clear();
+    if (out_pcm_data.size() >= OUT_PCM_BUFFER_SIZE) {
+      fwrite(out_pcm_data.data(), 1, out_pcm_data.size(), fp_out);
+      out_pcm_data.clear();
       printf(".");
       fflush(stdout);
     }
@@ -322,9 +273,9 @@ int32_t main(int argc, char* argv[]) {
 
   if (fp_out != NULL) {
 
-    if (opm.out_pcm_data.size() >= 4) {
-      fwrite(opm.out_pcm_data.data(), 1, opm.out_pcm_data.size(), fp_out);
-      opm.out_pcm_data.clear();
+    if (out_pcm_data.size() >= 4) {
+      fwrite(out_pcm_data.data(), 1, out_pcm_data.size(), fp_out);
+      out_pcm_data.clear();
       printf(".");
       fflush(stdout);
     }
@@ -335,7 +286,7 @@ int32_t main(int argc, char* argv[]) {
 
   if (rc == -1) rc = 0;
 
-  std::cout << "Stopped." << std::endl;
+  printf("Stopped.\n");
 
 exit:
   return rc;
