@@ -93,12 +93,13 @@ exit:
 class SerialOPM {
 
   public:
-    static const uint32_t OPM_SAMPLE_RATE = 62500;
+    static const uint32_t OPM_CLOCK = 4000000;
+    static const uint32_t OPM_SAMPLE_RATE = 62500;    // = 4000000 / 2 / 32
+    static const uint32_t OPM_STEP = 16;              // = 1000000 / 62500;
     static const uint32_t OUT_SAMPLE_RATE = 44100;
-    static const uint32_t OUT_PCM_BUFFER_SIZE = 44100 * 4 * 1;
 
   public:
-    SerialOPM(uint32_t clock);
+    SerialOPM();
     ~SerialOPM();
     void reset();
     void generate();
@@ -107,7 +108,6 @@ class SerialOPM {
     bool is_busy();
 
   private:
-    uint32_t clock;
     uint32_t downsample_counter;
     ymfm::ymfm_interface* ymfm_inf;
     ymfm::ym2151* opm_chip;
@@ -118,9 +118,7 @@ class SerialOPM {
 
 };
 
-SerialOPM::SerialOPM(uint32_t clock) {
-
-  this->clock = clock;
+SerialOPM::SerialOPM() {
 
   this->ymfm_inf = new ymfm::ymfm_interface();
   this->opm_chip = new ymfm::ym2151(*(this->ymfm_inf));
@@ -174,10 +172,12 @@ void SerialOPM::write(uint8_t opm_reg, uint8_t opm_data) {
     this->generate();
   }
   this->opm_chip->write_address(opm_reg);
+
   while (this->is_busy()) {
     this->generate();
   }
   this->opm_chip->write_data(opm_data);
+
   this->generate();
 }
 
@@ -213,12 +213,19 @@ int32_t main(int argc, char* argv[]) {
 
 
   // serial OPM engine
-  SerialOPM opm = SerialOPM(4000000);
+  SerialOPM opm = SerialOPM();
   std::cout << "Completed YM2151 engine initialization." << std::endl;
 
 
+  // usage
+  if (argc < 3) {
+    std::cout << "usage: serialopm <serial-device> <output-file>" << std::endl;
+    goto exit;
+  }
+
+
   // UART receiver
-  serial_port = open_serial_port("/dev/tty.usbserial-A10ORWNF");
+  serial_port = open_serial_port(argv[1]);
   if (serial_port <= 0) {
     goto exit;
   }
@@ -234,7 +241,7 @@ int32_t main(int argc, char* argv[]) {
   read_len = 0;
   while (!g_abort_program) {
 
-    int32_t len = read(serial_port, read_buf + read_len, 10 - read_len);
+    int32_t len = read(serial_port, read_buf + read_len, 12 - read_len);
     if (len < 0) {
       printf("Error reading: %s", strerror(errno));
       rc = -2;
@@ -244,36 +251,37 @@ int32_t main(int argc, char* argv[]) {
     if (len == 0) continue;
 
     read_len += len;
-    if (read_len < 10) continue;     // minimum length to detect 5 messages
+    if (read_len < 12) continue;     // minimum length to detect 6 messages
 
-    printf("%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n", 
-            read_buf[0], read_buf[1], read_buf[2], read_buf[3], read_buf[4], 
-            read_buf[5], read_buf[6], read_buf[7], read_buf[8], read_buf[9]);
+    printf("%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n", 
+            read_buf[0], read_buf[1], read_buf[2], read_buf[3], read_buf[4], read_buf[5],
+            read_buf[6], read_buf[7], read_buf[8], read_buf[9], read_buf[10], read_buf[11]);
 
-    if (opm.is_opm_register(read_buf[0]) &&
-        opm.is_opm_register(read_buf[2]) &&
-        opm.is_opm_register(read_buf[4]) &&
-        opm.is_opm_register(read_buf[6]) &&
-        opm.is_opm_register(read_buf[8])) {
+    if (opm.is_opm_register(read_buf[0]) && opm.is_opm_register(read_buf[2]) &&
+        opm.is_opm_register(read_buf[4]) && opm.is_opm_register(read_buf[6]) &&
+        opm.is_opm_register(read_buf[8]) && opm.is_opm_register(read_buf[10])) {
       opm.write(read_buf[0], read_buf[1]);
       opm.write(read_buf[2], read_buf[3]);
       opm.write(read_buf[4], read_buf[5]);
       opm.write(read_buf[6], read_buf[7]);
       opm.write(read_buf[8], read_buf[9]);
+      opm.write(read_buf[10], read_buf[11]);
+      std::cout << "Detected OPM data stream." << std::endl;
       break;
     } else {
-      memmove(read_buf, read_buf + 1, 9);
+      memmove(read_buf, read_buf + 1, 11);
       read_len = 9;
     }
 
   }
 
-  // output file prep
+
+  // prep output file
   if (!g_abort_program) {
-    fp_out = fopen("output.s44", "wb");
+    fp_out = fopen(argv[2], "wb");
+    gettimeofday(&start_time, NULL);
   }
 
-  gettimeofday(&start_time, NULL);
 
   // main loop
   while (!g_abort_program) {
@@ -288,13 +296,6 @@ int32_t main(int argc, char* argv[]) {
     for (int32_t i = 0; i < len; i++) {
       if (opm_reg == 0) {
         opm_reg = read_buf[ i ];
-        if (i + 1 < len) {
-          opm_data = read_buf[ i + 1 ];
-          i++;
-          opm.write(opm_reg, opm_data);
-          opm_reg = 0;
-          opm_data = 0;
-        }
       } else {
         opm_data = read_buf[ i ];
         opm.write(opm_reg, opm_data);
@@ -304,12 +305,15 @@ int32_t main(int argc, char* argv[]) {
     }
 
     gettimeofday(&current_time, NULL);
+
     uint32_t elapsed_usec = (current_time.tv_sec - start_time.tv_sec) * 1000000 + (current_time.tv_usec - start_time.tv_usec);
-    uint32_t total_ticks = elapsed_usec * SerialOPM::OPM_SAMPLE_RATE / 1000000;
+    uint32_t total_ticks = elapsed_usec / SerialOPM::OPM_STEP;
+
     while (opm.generated_counter < total_ticks) {
       opm.generate();
     }
-    if (opm.out_pcm_data.size() >= SerialOPM::OUT_PCM_BUFFER_SIZE) {
+
+    if (opm.out_pcm_data.size() >= SerialOPM::OUT_SAMPLE_RATE * 4 * 1) {
       fwrite(opm.out_pcm_data.data(), 1, opm.out_pcm_data.size(), fp_out);
       opm.out_pcm_data.clear();
       printf(".");

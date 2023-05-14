@@ -37,8 +37,8 @@
 #include <signal.h>
 #include <sys/time.h>
 
-#include "../src/ymfm.h"
-#include "../src/ymfm_opm.h"
+#include "../../src/ymfm.h"
+#include "../../src/ymfm_opm.h"
 
 #define VERSION "0.4.0 (2023/05/13)"
 
